@@ -5,6 +5,7 @@ import time
 import logging
 from typing import List, Optional, Tuple, Dict
 
+from visualization import generate_visualizations
 logger = logging.getLogger("qcentroid-user-log")
 
 # ── Domain Objects ──────────────────────────────────────────────────────────
@@ -306,4 +307,5 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     }
 
     logger.info(f"Classical Solver v2 done. Routes: {len(routes_output)}, status: {solution_status}, on_time: {on_time_prob:.1%}")
+    generate_visualizations(input_data, result)
     return result
