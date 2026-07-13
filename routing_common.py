@@ -1,30 +1,19 @@
 """
 routing_common.py - Shared core for the Real-Time Adaptive Routing Under
-Uncertainty use case (QCentroid).
+Uncertainty use case (QCentroid). Both solvers import it so they parse the same
+VRP-under-uncertainty schema, run the same local search (2-opt / or-opt / swap
++ multi-start), and emit an identical enriched EUR benchmark schema.
 
-Both the Classical Adaptive Routing Solver and the Quantum-Inspired Routing
-Solver import this module so that:
-
-  1. They parse the SAME rich VRP-under-uncertainty input schema (depot,
-     customers, vehicles, disruptions, cost_parameters, constraints,
-     service_level_targets, traffic/weather feeds).
-  2. They run the SAME local-search polish (intra-route 2-opt + inter-route
-     or-opt) after their own construction step. This is the key fix for the
-     quantum solver, whose bare QUBO/SQA assignment (no route optimisation)
-     was the bottleneck.
-  3. They emit an IDENTICAL, enriched output/benchmark schema: many top-level
-     numeric headline metrics (all plotted by the platform), a benchmark dict,
-     and consistent units (objective_value = total economic cost in EUR).
-
-Pure standard library - no third-party dependency.
+Pure standard library.
 """
 import math
 import time
+import random
 import hashlib
 import json
 from datetime import datetime, timezone
 
-COMMON_VERSION = "3.1.0"
+COMMON_VERSION = "3.2.0"
 
 # -- Geo ----------------------------------------------------------------------
 
@@ -284,6 +273,50 @@ def or_opt(assignment, locs, depot_id, vehicles, uncertainty, disrupted,
     return assignment
 
 
+def swap_move(assignment, locs, depot_id, vehicles, uncertainty, disrupted,
+              capacities, max_pass=4):
+    """Inter-route exchange: swap a stop of k1 with a stop of k2 when it lowers
+    the combined route objective and respects both capacities. Complements
+    or-opt; swaps escape optima that relocation alone cannot."""
+    def sp(k):
+        return vehicles[k]["speed_kmh"]
+
+    def load(ids):
+        return sum(locs[s]["demand"] for s in ids)
+
+    keys = list(assignment.keys())
+    improved = True
+    passes = 0
+    while improved and passes < max_pass:
+        improved = False
+        passes += 1
+        for ki in range(len(keys)):
+            for kj in range(ki + 1, len(keys)):
+                k1, k2 = keys[ki], keys[kj]
+                r1, r2 = assignment[k1], assignment[k2]
+                if not r1 or not r2:
+                    continue
+                for ai in range(len(r1)):
+                    for bi in range(len(r2)):
+                        a, b = r1[ai], r2[bi]
+                        l1 = load(r1) - locs[a]["demand"] + locs[b]["demand"]
+                        l2 = load(r2) - locs[b]["demand"] + locs[a]["demand"]
+                        if l1 > capacities[k1] + 1e-9 or l2 > capacities[k2] + 1e-9:
+                            continue
+                        old = (_route_obj(r1, locs, depot_id, sp(k1), uncertainty, disrupted)
+                               + _route_obj(r2, locs, depot_id, sp(k2), uncertainty, disrupted))
+                        n1 = list(r1); n1[ai] = b
+                        n2 = list(r2); n2[bi] = a
+                        new = (_route_obj(n1, locs, depot_id, sp(k1), uncertainty, disrupted)
+                               + _route_obj(n2, locs, depot_id, sp(k2), uncertainty, disrupted))
+                        if new < old - 1e-6:
+                            assignment[k1] = n1
+                            assignment[k2] = r2 = n2
+                            r1 = assignment[k1]
+                            improved = True
+    return assignment
+
+
 def nearest_neighbour_init(prob):
     """Greedy capacity-feasible construction; returns dict veh_idx -> [stop_ids]."""
     depot = prob["depot"]
@@ -327,7 +360,7 @@ def _loc_index(prob):
 
 
 def polish(assignment, prob, uncertainty, disrupted):
-    """Run 2-opt on each route then or-opt across routes, to convergence."""
+    """2-opt on each route, then alternate or-opt + swap across routes (v3.2)."""
     _CTX["cost_model"] = prob["cost_model"]
     depot = prob["depot"]
     vehicles = prob["vehicles"]
@@ -336,8 +369,11 @@ def polish(assignment, prob, uncertainty, disrupted):
     for k in assignment:
         assignment[k] = two_opt(assignment[k], locs, depot["id"],
                                 vehicles[k]["speed_kmh"], uncertainty, disrupted)
-    assignment = or_opt(assignment, locs, depot["id"], vehicles, uncertainty,
-                        disrupted, capacities)
+    for _round in range(2):
+        assignment = or_opt(assignment, locs, depot["id"], vehicles, uncertainty,
+                            disrupted, capacities)
+        assignment = swap_move(assignment, locs, depot["id"], vehicles, uncertainty,
+                               disrupted, capacities)
     for k in assignment:
         assignment[k] = two_opt(assignment[k], locs, depot["id"],
                                 vehicles[k]["speed_kmh"], uncertainty, disrupted)
@@ -355,6 +391,44 @@ def capacity_overload(assignment, prob):
         if load > cap:
             over += load - cap
     return over
+
+
+def _perturb(assignment, prob, rng):
+    """Capacity-respecting random relocation kick to diversify a restart."""
+    locs = {c["id"]: c for c in prob["customers"]}
+    caps = {k: prob["vehicles"][k]["capacity"] for k in assignment}
+    keys = [k for k in assignment if assignment[k]]
+    if len(keys) < 2:
+        return assignment
+    k1 = rng.choice(keys)
+    stop = rng.choice(assignment[k1])
+    demand = locs[stop]["demand"]
+    feasible_k2 = [k for k in assignment if k != k1
+                   and sum(locs[s]["demand"] for s in assignment[k]) + demand <= caps[k]]
+    if not feasible_k2:
+        return assignment
+    k2 = rng.choice(feasible_k2)
+    assignment[k1] = [s for s in assignment[k1] if s != stop]
+    pos = rng.randint(0, len(assignment[k2]))
+    assignment[k2] = assignment[k2][:pos] + [stop] + assignment[k2][pos:]
+    return assignment
+
+
+def greedy_multistart(prob, uncertainty, disrupted, restarts=6, seed=42):
+    """Greedy construction + full local-search polish + perturbation restarts.
+    Shared by BOTH solvers so the quantum fallback is never weaker than the
+    classical baseline (it keeps the better of this and its QUBO seed)."""
+    rng = random.Random(seed)
+    best = polish({k: list(v) for k, v in nearest_neighbour_init(prob).items()},
+                  prob, uncertainty, disrupted)
+    best_obj = assignment_objective(best, prob, uncertainty, disrupted)
+    for _ in range(max(0, restarts - 1)):
+        cand = _perturb({k: list(v) for k, v in best.items()}, prob, rng)
+        cand = polish(cand, prob, uncertainty, disrupted)
+        obj = assignment_objective(cand, prob, uncertainty, disrupted)
+        if obj < best_obj - 1e-6:
+            best, best_obj = cand, obj
+    return best, best_obj
 
 
 def assignment_objective(assignment, prob, uncertainty, disrupted):
@@ -442,8 +516,6 @@ def build_result(assignment, prob, input_data, elapsed_s, solver_meta):
 
     avg_util = round(100.0 * (sum(util_list) / max(len(util_list), 1)), 2)
 
-    # Baseline = greedy nearest-neighbour + single 2-opt per route (competent
-    # manual plan). Savings quantify the value the optimiser adds on top.
     base_assign = nearest_neighbour_init(prob)
     _CTX["cost_model"] = cost_model
     for _k in base_assign:
@@ -529,7 +601,7 @@ def build_result(assignment, prob, input_data, elapsed_s, solver_meta):
             "vehicles_used": used,
             **solver_meta.get("extra_metrics", {}),
         },
-        "solver_version": solver_meta.get("solver_version", "3.1.0"),
+        "solver_version": solver_meta.get("solver_version", "3.2.0"),
         "common_version": COMMON_VERSION,
         "dataset_sha256": _sha256_of(input_data),
         "run_started_at_utc": datetime.now(timezone.utc).isoformat(),
