@@ -16,9 +16,7 @@ Solver import this module so that:
      numeric headline metrics (all plotted by the platform), a benchmark dict,
      and consistent units (objective_value = total economic cost in EUR).
 
-Pure standard library - no third-party dependency - so the light classical
-solver stays dependency-free while the quantum solver adds only numpy for its
-QUBO/SQA core.
+Pure standard library - no third-party dependency.
 """
 import math
 import time
@@ -26,7 +24,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-COMMON_VERSION = "2.0.0"
+COMMON_VERSION = "3.1.0"
 
 # -- Geo ----------------------------------------------------------------------
 
@@ -44,13 +42,7 @@ def haversine(lat1, lon1, lat2, lon2):
 # -- Input parsing ------------------------------------------------------------
 
 def parse_input(input_data):
-    """
-    Normalise the platform dataset into a single canonical problem dict.
-    Handles the customers/stops, vehicles/fleet and depot/depots duplications
-    that appear in the platform datasets, and pulls the economic cost model,
-    constraints and SLA targets so every solver optimises and reports against
-    the same numbers.
-    """
+    """Normalise the platform dataset into a single canonical problem dict."""
     depot = input_data.get("depot")
     if not depot:
         depots = input_data.get("depots") or []
@@ -164,11 +156,7 @@ def effective_uncertainty(prob):
 # -- Route evaluation ---------------------------------------------------------
 
 def route_analytics(stop_ids, locs, depot_id, speed_kmh, uncertainty, disrupted):
-    """
-    Deterministic evaluation of one ordered route. Returns time (minutes, incl.
-    soft TW penalty), distance (km), per-stop ETAs, on-time flags and
-    time-window violations.
-    """
+    """Deterministic evaluation of one ordered route."""
     current_time = 0.0
     seq = [depot_id] + list(stop_ids) + [depot_id]
     stop_etas = {}
@@ -210,10 +198,7 @@ def route_analytics(stop_ids, locs, depot_id, speed_kmh, uncertainty, disrupted)
     }
 
 
-# Optimisation context: the economic cost model in force during local search.
-# Set by polish()/assignment_objective() so the search minimises the SAME euro
-# objective the platform reports (fuel + driver + lateness), which makes the
-# solver consolidate vehicles instead of leaving one half-empty.
+# Optimisation context: economic cost model in force during local search.
 _CTX = {"cost_model": None}
 
 
@@ -256,11 +241,7 @@ def two_opt(stop_ids, locs, depot_id, speed_kmh, uncertainty, disrupted, max_pas
 
 def or_opt(assignment, locs, depot_id, vehicles, uncertainty, disrupted,
            capacities, max_pass=6):
-    """
-    Inter-route relocation: move a single stop from one vehicle to another when
-    it lowers the total objective and respects capacity.
-    assignment : dict vehicle_index -> ordered list of stop_ids.
-    """
+    """Inter-route relocation: move a stop to another vehicle if it lowers cost."""
     def veh_speed(k):
         return vehicles[k]["speed_kmh"]
 
@@ -377,8 +358,7 @@ def capacity_overload(assignment, prob):
 
 
 def assignment_objective(assignment, prob, uncertainty, disrupted):
-    """Economic EUR objective + a large penalty for any capacity overload, so
-    infeasible (over-consolidated) plans never rank as best."""
+    """Economic EUR objective + large penalty for capacity overload."""
     _CTX["cost_model"] = prob["cost_model"]
     locs = _loc_index(prob)
     vehicles = prob["vehicles"]
@@ -395,11 +375,7 @@ def assignment_objective(assignment, prob, uncertainty, disrupted):
 # -- Result assembly (identical schema for every solver) ----------------------
 
 def build_result(assignment, prob, input_data, elapsed_s, solver_meta):
-    """
-    Turn a vehicle->[stop_ids] assignment into the full standardised result dict
-    with many top-level numeric benchmark metrics + benchmark dict + compliance
-    fields. All solvers call this so the schema is identical.
-    """
+    """Standardised result dict with numeric benchmark metrics + benchmark dict."""
     depot = prob["depot"]
     vehicles = prob["vehicles"]
     customers = prob["customers"]
@@ -466,6 +442,25 @@ def build_result(assignment, prob, input_data, elapsed_s, solver_meta):
 
     avg_util = round(100.0 * (sum(util_list) / max(len(util_list), 1)), 2)
 
+    # Baseline = greedy nearest-neighbour + single 2-opt per route (competent
+    # manual plan). Savings quantify the value the optimiser adds on top.
+    base_assign = nearest_neighbour_init(prob)
+    _CTX["cost_model"] = cost_model
+    for _k in base_assign:
+        base_assign[_k] = two_opt(base_assign[_k], locs, depot["id"],
+                                  vehicles[_k]["speed_kmh"], uncertainty, disrupted)
+    baseline_cost_eur = round(assignment_objective(base_assign, prob, uncertainty, disrupted), 3)
+    savings_vs_baseline_pct = round(100.0 * (baseline_cost_eur - total_cost_eur)
+                                    / max(baseline_cost_eur, 1e-6), 2)
+
+    l_per_100 = 9.5
+    fcm = input_data.get("fuel_consumption_model", {}) or {}
+    if isinstance(fcm, dict):
+        l_per_100 = float(fcm.get("base_consumption_l_per_100km", l_per_100))
+    fuel_litres = total_km * l_per_100 / 100.0
+    co2_kg = fuel_litres * 2.68
+    cost_per_stop_eur = round(total_cost_eur / max(n_cust, 1), 3)
+
     stress_disrupted = {kk: vv * 1.5 for kk, vv in disrupted.items()}
     stressed_obj = 0.0
     for k, ids in assignment.items():
@@ -504,6 +499,10 @@ def build_result(assignment, prob, input_data, elapsed_s, solver_meta):
         "disruptions_absorbed": len(prob["disruptions"]),
         "compute_time_s": round(elapsed_s, 3),
         "sla_compliant": 1 if sla_met else 0,
+        "baseline_cost_eur": baseline_cost_eur,
+        "savings_vs_baseline_pct": savings_vs_baseline_pct,
+        "cost_per_stop_eur": cost_per_stop_eur,
+        "co2_kg": round(co2_kg, 2),
         "solver_type": solver_meta["solver_type"],
         "algorithm": solver_meta["algorithm"],
         "solution_status": status,
@@ -530,7 +529,7 @@ def build_result(assignment, prob, input_data, elapsed_s, solver_meta):
             "vehicles_used": used,
             **solver_meta.get("extra_metrics", {}),
         },
-        "solver_version": solver_meta.get("solver_version", "2.0.0"),
+        "solver_version": solver_meta.get("solver_version", "3.1.0"),
         "common_version": COMMON_VERSION,
         "dataset_sha256": _sha256_of(input_data),
         "run_started_at_utc": datetime.now(timezone.utc).isoformat(),
