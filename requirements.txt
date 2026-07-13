@@ -1,1 +1,1 @@
-
+# Classical Adaptive Routing Solver - pure standard library, no third-party deps
